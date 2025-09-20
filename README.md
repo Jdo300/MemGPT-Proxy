@@ -1,5 +1,33 @@
-# MemGPT-Proxy
-Python script that creates a Proxy server to translate the MemGPT server's client protocol into a standard OpenAI ChatCompletion format with additional parameters provided to get the agent's inner thoughts and function calls executed.
+# Letta OpenAI Proxy
 
-# Setup Instructions
-Simply change the `API_TOKEN` and `MEMGPT_BASE_URL` values to your MemGPT API Server's Token and URL and run the script. Then you should be able to access your MemGPT agents as if they were OpenAI models. Use the name of your MemGPT agent in the model field when making requests. 
+This project provides a FastAPI server that exposes a minimal OpenAI-compatible API and forwards requests to a [Letta](https://docs.letta.com/) agent server.
+
+## Features
+- `POST /v1/chat/completions` – accepts OpenAI-style chat completion requests and routes the latest message to a Letta agent.
+- `GET /v1/models` – lists available agents on the Letta server as if they were OpenAI models.
+- Basic support for tool calling and streaming.
+
+## Setup
+```bash
+pip install -r requirements.txt
+```
+
+## Running
+```bash
+uvicorn main:app --reload
+```
+
+The proxy assumes a Letta server is available at `https://jetson-letta.resonancegroupusa.com`.
+
+## Testing
+```bash
+# non-streaming
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Milo","messages":[{"role":"user","content":"What\'s two plus two?"}]}'
+
+# streaming
+curl -N -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Milo","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
