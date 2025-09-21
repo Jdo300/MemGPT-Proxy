@@ -17,7 +17,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-The proxy assumes a Letta server is available at `https://jetson-letta.resonancegroupusa.com`.
+The proxy assumes a Letta server is available at `https://your-letta-server.com`.
 
 ## Testing
 ```bash
