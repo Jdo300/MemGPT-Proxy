@@ -15,7 +15,7 @@ from letta_client.types import (
     ToolReturnMessage,
 )
 
-LETTA_BASE_URL = "https://jetson-letta.resonancegroupusa.com"
+LETTA_BASE_URL = "https://your-letta-server.com"
 
 app = FastAPI()
 
