@@ -12,12 +12,37 @@ This project provides a FastAPI server that exposes a minimal OpenAI-compatible 
 pip install -r requirements.txt
 ```
 
+## Configuration
+
+The proxy uses environment variables for configuration. Set the following variables:
+
+### Required Environment Variables
+
+- `LETTA_BASE_URL` - URL of your Letta server (default: `https://your-letta-server.com`)
+- `LETTA_API_KEY` - API key for Letta authentication (optional for local servers)
+
+### For Letta Cloud
+```bash
+export LETTA_BASE_URL="https://api.letta.com"
+export LETTA_API_KEY="your-letta-api-key"
+export LETTA_PROJECT="your-project-name"
+```
+
+### For Local Letta Server
+```bash
+export LETTA_BASE_URL="http://localhost:8283"
+# LETTA_API_KEY is optional for local servers
+```
+
 ## Running
 ```bash
 uvicorn main:app --reload
 ```
 
-The proxy assumes a Letta server is available at `https://your-letta-server.com`.
+## Health Check
+```bash
+curl http://localhost:8000/health
+```
 
 ## Testing
 ```bash

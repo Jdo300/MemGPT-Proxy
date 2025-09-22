@@ -1,6 +1,8 @@
 import json
+import os
 import time
 import uuid
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -15,7 +17,18 @@ from letta_client.types import (
     ToolReturnMessage,
 )
 
-LETTA_BASE_URL = "https://your-letta-server.com"
+from proxy_tool_bridge import ProxyToolBridge, initialize_proxy_bridge, get_proxy_bridge
+
+# Configuration from environment variables
+LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
+LETTA_API_KEY = os.getenv("LETTA_API_KEY")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -28,14 +41,50 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Dict[str, Any]]
     stream: Optional[bool] = False
     tools: Optional[List[Dict[str, Any]]] = None
+    tool_results: Optional[List[Dict[str, Any]]] = None
 
+
+def validate_configuration() -> None:
+    """Validate that required environment variables are set."""
+    if LETTA_BASE_URL == "http://localhost:8283":
+        logger.warning("LETTA_BASE_URL is using default value. Please set LETTA_BASE_URL environment variable.")
+    if not LETTA_API_KEY:
+        logger.warning("LETTA_API_KEY not set. Authentication may fail for Letta Cloud.")
 
 @app.on_event("startup")
 async def startup_event() -> None:
     global client, agent_map
-    client = AsyncLetta(base_url=LETTA_BASE_URL)
-    agents = await client.agents.list()
-    agent_map = {agent.name: agent.id for agent in agents}
+
+    # Validate configuration
+    validate_configuration()
+
+    # Configure client with API key if provided
+    client_kwargs = {"base_url": LETTA_BASE_URL}
+    if LETTA_API_KEY:
+        # For Letta Cloud, use token and project
+        if "letta.com" in LETTA_BASE_URL:
+            client_kwargs.update({
+                "token": LETTA_API_KEY,
+                "project": os.getenv("LETTA_PROJECT", "default-project")
+            })
+        else:
+            # For local servers, API key might be used differently
+            client_kwargs["token"] = LETTA_API_KEY
+
+    client = AsyncLetta(**client_kwargs)
+
+    try:
+        agents = await client.agents.list()
+        agent_map = {agent.name: agent.id for agent in agents}
+        logger.info(f"Connected to Letta server. Found {len(agents)} agents.")
+
+        # Initialize proxy tool bridge
+        initialize_proxy_bridge(client)
+        logger.info("Proxy tool bridge initialized successfully.")
+
+    except Exception as e:
+        logger.error(f"Failed to connect to Letta server: {e}")
+        raise
 
 
 @app.get("/v1/models")
@@ -53,100 +102,306 @@ async def list_models() -> Dict[str, Any]:
     return {"object": "list", "data": data}
 
 
+@app.get("/health")
+async def health_check() -> Dict[str, Any]:
+    """Health check endpoint for monitoring."""
+    return {
+        "status": "healthy",
+        "letta_base_url": LETTA_BASE_URL,
+        "letta_connected": client is not None,
+        "agents_loaded": len(agent_map) if agent_map else 0
+    }
+
+
 async def _prepare_message(last: Dict[str, Any]) -> MessageCreate:
     role = last.get("role")
     if role == "user":
         content = last.get("content", "")
         return MessageCreate(role="user", content=[TextContent(text=content)])
-    elif role == "tool":
-        from letta_client.types import ToolReturnContent
-
-        content = last.get("content", "")
-        tool_call_id = last.get("tool_call_id")
-        if not tool_call_id:
-            raise HTTPException(status_code=400, detail="tool_call_id required for tool messages")
-        return MessageCreate(
-            role="assistant",
-            content=[
-                ToolReturnContent(
-                    tool_call_id=tool_call_id,
-                    content=content,
-                    is_error=False,
-                )
-            ],
-        )
     else:
-        raise HTTPException(status_code=400, detail="Unsupported message role")
+        # For now, only handle user messages. Tool messages would require
+        # more complex handling with the Letta SDK
+        raise HTTPException(status_code=400, detail=f"Unsupported message role: {role}. Currently only 'user' role is supported.")
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest) -> Any:
-    if body.model not in agent_map:
-        raise HTTPException(status_code=404, detail="Unknown model")
-    agent_id = agent_map[body.model]
+    # Handle model mapping - Open WebUI might use different model names than agent names
+    agent_id = None
+    if body.model in agent_map:
+        agent_id = agent_map[body.model]
+    else:
+        # Try to find a matching agent (case-insensitive, partial match)
+        for agent_name, aid in agent_map.items():
+            if body.model.lower() in agent_name.lower() or agent_name.lower() in body.model.lower():
+                agent_id = aid
+                logger.info(f"Model '{body.model}' mapped to agent '{agent_name}'")
+                break
+
+        # If still no match, use the first available agent as fallback
+        if not agent_id and agent_map:
+            first_agent_name = list(agent_map.keys())[0]
+            agent_id = agent_map[first_agent_name]
+            logger.warning(f"Model '{body.model}' not found, using fallback agent '{first_agent_name}'")
+
+    if not agent_id:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}. Available models: {list(agent_map.keys())}")
+
+    actual_agent_name = list(agent_map.keys())[list(agent_map.values()).index(agent_id)]
+    logger.info(f"Using agent: {actual_agent_name} for model: {body.model}")
+
+    # Log tool information if provided
+    if body.tools:
+        logger.info(f"Request includes {len(body.tools)} tools: {[tool['function']['name'] for tool in body.tools]}")
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages required")
     message = await _prepare_message(body.messages[-1])
 
+    # Handle tool results if provided (non-streaming case)
+    if body.tool_results and not body.stream:
+        # Process tool results and send them to Letta
+        tool_return_messages = []
+        for tool_result in body.tool_results:
+            tool_return_messages.append(
+                MessageCreate(
+                    role="tool",
+                    content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
+                    tool_call_id=tool_result.get("tool_call_id")
+                )
+            )
+        
+        # Send tool results to Letta agent
+        if tool_return_messages:
+            await client.agents.messages.create(
+                agent_id=agent_id,
+                messages=tool_return_messages
+            )
+
     if body.stream:
         async def event_stream():
             assert client is not None
-            async for event in client.agents.messages.create_stream(agent_id=agent_id, messages=[message]):
-                if isinstance(event, ToolCallMessage):
-                    chunk = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex}",
-                        "object": "chat.completion.chunk",
-                        "model": body.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": "",
-                                    "tool_calls": [
-                                        {
-                                            "id": event.tool_call.tool_call_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": event.tool_call.name,
-                                                "arguments": event.tool_call.arguments,
-                                            },
-                                        }
-                                    ],
-                                },
-                                "finish_reason": "tool_calls",
-                            }
-                        ],
-                    }
+            try:
+                # Sync tools with agent if provided
+                if body.tools:
+                    proxy_bridge = get_proxy_bridge()
+                    await proxy_bridge.sync_agent_tools(agent_id, body.tools)
+                    logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
+
+                # Prepare messages for streaming - include tool results if present
+                streaming_messages = []
+                if body.tool_results:
+                    # Add tool return messages first, then the user message
+                    tool_return_messages = []
+                    for tool_result in body.tool_results:
+                        tool_return_messages.append(
+                            MessageCreate(
+                                role="tool",
+                                content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
+                                tool_call_id=tool_result.get("tool_call_id")
+                            )
+                        )
+                    streaming_messages.extend(tool_return_messages)
+                
+                streaming_messages.append(message)
+                
+                async for event in client.agents.messages.create_stream(
+                    agent_id=agent_id,
+                    messages=streaming_messages,
+                    stream_tokens=True
+                ):
+                    # Create unique ID for this chunk
+                    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+                    # Handle reasoning/thinking messages
+                    if hasattr(event, 'message_type') and event.message_type == 'reasoning_message':
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "reasoning": event.reasoning
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+
+                    # Handle assistant content messages
+                    elif hasattr(event, 'message_type') and event.message_type == 'assistant_message':
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": event.content
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+
+                    # Handle tool calls
+                    elif hasattr(event, 'message_type') and event.message_type == 'tool_call_message':
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": event.tool_call.tool_call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": event.tool_call.name,
+                                                    "arguments": event.tool_call.arguments,
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+
+                    # Handle stop/completion
+                    elif hasattr(event, 'message_type') and event.message_type == 'stop_reason':
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": event.stop_reason,
+                                }
+                            ],
+                        }
+
+                    # Legacy handling for events without message_type
+                    elif isinstance(event, ToolCallMessage):
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": event.tool_call.tool_call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": event.tool_call.name,
+                                                    "arguments": event.tool_call.arguments,
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+
+                    elif isinstance(event, AssistantMessage):
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": event.content
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+
+                    else:
+                        # Skip unknown event types
+                        continue
+
+                    # Yield the chunk immediately for real-time streaming
                     yield f"data: {json.dumps(chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                if isinstance(event, AssistantMessage):
-                    chunk = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex}",
-                        "object": "chat.completion.chunk",
-                        "model": body.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": event.content},
-                                "finish_reason": "stop",
-                            }
-                        ],
+
+            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                error_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "error",
+                    "error": {
+                        "message": f"Streaming error: {str(e)}",
+                        "type": "streaming_error"
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+
+            # Send final DONE message
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     assert client is not None
+    
+    # Handle tool results if provided (non-streaming case)
+    if body.tool_results:
+        # Process tool results and send them to Letta
+        tool_return_messages = []
+        for tool_result in body.tool_results:
+            tool_return_messages.append(
+                MessageCreate(
+                    role="tool",
+                    content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
+                    tool_call_id=tool_result.get("tool_call_id")
+                )
+            )
+        
+        # Send tool results to Letta agent
+        if tool_return_messages:
+            await client.agents.messages.create(
+                agent_id=agent_id,
+                messages=tool_return_messages
+            )
+    
+    # Sync tools with agent if provided
+    if body.tools:
+        proxy_bridge = get_proxy_bridge()
+        await proxy_bridge.sync_agent_tools(agent_id, body.tools)
+        logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
+
     resp = await client.agents.messages.create(agent_id=agent_id, messages=[message])
-    assistant: Optional[AssistantMessage] = None
+    assistant_messages: List[AssistantMessage] = []
     tool_calls: List[ToolCallMessage] = []
     tool_returns: List[ToolReturnMessage] = []
     for m in resp.messages:
         if isinstance(m, AssistantMessage):
-            assistant = m
+            assistant_messages.append(m)
         elif isinstance(m, ToolCallMessage):
             tool_calls.append(m)
         elif isinstance(m, ToolReturnMessage):
@@ -154,12 +409,15 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
 
     response_message: Dict[str, Any]
     finish_reason = "stop"
-    if tool_calls and not tool_returns and assistant is None:
+
+    # Handle tool calls according to OpenAI API format
+    if tool_calls and not tool_returns and not assistant_messages:
         response_message = {
             "role": "assistant",
             "content": "",
             "tool_calls": [
                 {
+                    "index": i,
                     "id": tc.tool_call.tool_call_id,
                     "type": "function",
                     "function": {
@@ -167,13 +425,37 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                         "arguments": tc.tool_call.arguments,
                     },
                 }
-                for tc in tool_calls
+                for i, tc in enumerate(tool_calls)
             ],
         }
         finish_reason = "tool_calls"
     else:
-        content = assistant.content if assistant else ""
-        response_message = {"role": "assistant", "content": content}
+        # Handle regular assistant messages - combine all content
+        combined_content = ""
+        for msg in assistant_messages:
+            if msg.content:
+                if combined_content:
+                    combined_content += "\n\n"
+                combined_content += msg.content
+        
+        # Include reasoning from the first message that has it
+        reasoning_content = ""
+        for msg in assistant_messages:
+            if hasattr(msg, 'reasoning') and msg.reasoning:
+                reasoning_content = msg.reasoning
+                break
+        
+        response_message = {
+            "role": "assistant",
+            "content": combined_content
+        }
+        
+        # If there's reasoning content, include it in the content for OpenAI compatibility
+        if reasoning_content:
+            if combined_content:
+                response_message["content"] = f"{combined_content}\n\n[Reasoning: {reasoning_content}]"
+            else:
+                response_message["content"] = reasoning_content
 
     usage = resp.usage
     openai_resp = {
