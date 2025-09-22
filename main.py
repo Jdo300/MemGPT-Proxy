@@ -126,26 +126,16 @@ async def _prepare_message(last: Dict[str, Any]) -> MessageCreate:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest) -> Any:
-    # Handle model mapping - Open WebUI might use different model names than agent names
+    # Handle model mapping - require exact agent name match
     agent_id = None
     if body.model in agent_map:
         agent_id = agent_map[body.model]
+        logger.info(f"Model '{body.model}' matched to agent '{body.model}'")
     else:
-        # Try to find a matching agent (case-insensitive, partial match)
-        for agent_name, aid in agent_map.items():
-            if body.model.lower() in agent_name.lower() or agent_name.lower() in body.model.lower():
-                agent_id = aid
-                logger.info(f"Model '{body.model}' mapped to agent '{agent_name}'")
-                break
-
-        # If still no match, use the first available agent as fallback
-        if not agent_id and agent_map:
-            first_agent_name = list(agent_map.keys())[0]
-            agent_id = agent_map[first_agent_name]
-            logger.warning(f"Model '{body.model}' not found, using fallback agent '{first_agent_name}'")
-
-    if not agent_id:
-        raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}. Available models: {list(agent_map.keys())}")
+        # No fallbacks allowed - require exact match
+        available_agents = list(agent_map.keys())
+        logger.error(f"Model '{body.model}' not found. Available agents: {available_agents}")
+        raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}. Available models: {available_agents}")
 
     actual_agent_name = list(agent_map.keys())[list(agent_map.values()).index(agent_id)]
     logger.info(f"Using agent: {actual_agent_name} for model: {body.model}")

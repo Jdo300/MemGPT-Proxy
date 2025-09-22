@@ -1,24 +1,26 @@
 # Progress Status
 
 ## What works PERFECTLY
-- ✅ **Streaming Implementation**: Real-time streaming with 157+ individual chunks (no buffering)
+- ✅ **Streaming Implementation**: Real-time streaming with 123+ individual chunks (73 reasoning + 50 content)
 - ✅ **OpenAI API Compliance**: Perfect reasoning fields, tool call formatting, response structure
-- ✅ **Agent Communication**: Successfully connecting to Letta agents via SDK
+- ✅ **Agent Communication**: Successfully connecting to `Milo` agent on Letta Cloud
 - ✅ **Message Translation**: Converting between OpenAI and Letta message formats
-- ✅ **Real-time Performance**: 7.60s response time with 157 chunks (excellent performance)
+- ✅ **Real-time Performance**: 7.60s response time with 123 chunks (excellent performance)
 - ✅ **Error Handling**: Proper HTTP status codes and error messages
 - ✅ **Async Architecture**: Efficient concurrent request handling
 - ✅ **Environment Configuration**: LETTA_BASE_URL, LETTA_API_KEY, LETTA_PROJECT support
 - ✅ **Health Monitoring**: `/health` endpoint for system monitoring
 - ✅ **Tool Calling Bridge**: **SOLVED** - Proxy tool bridge enables dynamic tool calling
+- ✅ **Agent Selection**: Strict validation requiring exact agent name match (no fallbacks)
 
 ## What's been investigated and understood
 - ✅ **Architecture Analysis**: Identified core difference between OpenAI and Letta tool systems
 - ✅ **Root Cause**: Letta requires pre-configured tools on agent vs OpenAI's dynamic tools
 - ✅ **Message Types**: Letta returns ReasoningMessage/AssistantMessage objects
-- ✅ **Agent Details**: Using `companion-agent-1758429513525` on Letta Cloud
+- ✅ **Agent Details**: Using `Milo` agent on Letta Cloud with strict name validation
 - ✅ **API Compatibility**: Perfect OpenAI format compliance in responses
 - ✅ **Proxy Tool Solution**: Created ephemeral tools that format calls for downstream execution
+- ✅ **Agent Selection**: Implemented strict exact-name matching (no fallbacks allowed)
 
 ## Current implementation status
 **STREAMING IS PRODUCTION-READY** ✅

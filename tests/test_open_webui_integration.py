@@ -16,8 +16,8 @@ PROXY_BASE_URL = "http://localhost:8000/v1"
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
 
-# Test agent - using the one that works
-TEST_AGENT_NAME = "companion-agent-1758429513525"
+# Test agent - using Milo
+TEST_AGENT_NAME = "Milo"
 
 # Test tools that Open WebUI might send
 OPEN_WEBUI_TOOLS = [
