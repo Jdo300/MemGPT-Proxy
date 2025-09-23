@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
 from letta_client import AsyncLetta, MessageCreate
@@ -170,6 +170,8 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
     if body.stream:
         async def event_stream():
             assert client is not None
+            # Keep one id for the entire stream (OpenAI behavior)
+            stream_id = f"chatcmpl-{uuid.uuid4().hex}"
             try:
                 # Sync tools with agent if provided
                 if body.tools:
@@ -193,19 +195,30 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                     streaming_messages.extend(tool_return_messages)
                 
                 streaming_messages.append(message)
+
+                # Optional: primer delta with assistant role (improves client compatibility)
+                primer = {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": body.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(primer, ensure_ascii=False)}\n\n"
                 
                 async for event in client.agents.messages.create_stream(
                     agent_id=agent_id,
                     messages=streaming_messages,
                     stream_tokens=True
                 ):
-                    # Create unique ID for this chunk
-                    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
-
-                    # Handle reasoning/thinking messages
+                    # Build chunk from event
                     if hasattr(event, 'message_type') and event.message_type == 'reasoning_message':
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -213,7 +226,6 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "role": "assistant",
                                         "content": "",
                                         "reasoning": event.reasoning
                                     },
@@ -222,10 +234,9 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                             ],
                         }
 
-                    # Handle assistant content messages
                     elif hasattr(event, 'message_type') and event.message_type == 'assistant_message':
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -240,10 +251,9 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                             ],
                         }
 
-                    # Handle tool calls
                     elif hasattr(event, 'message_type') and event.message_type == 'tool_call_message':
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -251,8 +261,6 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "role": "assistant",
-                                        "content": "",
                                         "tool_calls": [
                                             {
                                                 "index": 0,
@@ -270,10 +278,9 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                             ],
                         }
 
-                    # Handle stop/completion
                     elif hasattr(event, 'message_type') and event.message_type == 'stop_reason':
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -289,7 +296,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                     # Legacy handling for events without message_type
                     elif isinstance(event, ToolCallMessage):
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -297,8 +304,6 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "role": "assistant",
-                                        "content": "",
                                         "tool_calls": [
                                             {
                                                 "index": 0,
@@ -318,7 +323,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
 
                     elif isinstance(event, AssistantMessage):
                         chunk = {
-                            "id": chunk_id,
+                            "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": body.model,
@@ -337,25 +342,33 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                         # Skip unknown event types
                         continue
 
-                    # Yield the chunk immediately for real-time streaming
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    # Yield the chunk immediately for real-time streaming (preserve raw '<' '>')
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
                 error_chunk = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "id": stream_id,
                     "object": "error",
                     "error": {
                         "message": f"Streaming error: {str(e)}",
                         "type": "streaming_error"
                     }
                 }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
 
             # Send final DONE message
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     assert client is not None
     
@@ -466,4 +479,5 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
             "total_tokens": usage.total_tokens,
         },
     }
-    return JSONResponse(openai_resp)
+    # Preserve raw "<" and ">" in non-stream JSON too
+    return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")
