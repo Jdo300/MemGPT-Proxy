@@ -34,6 +34,7 @@ class ProxyToolBridge:
         """Initialize the proxy tool bridge."""
         self.client = letta_client
         self.tool_mapping: Dict[str, str] = {}  # OpenAI name -> Letta tool ID
+        self.letta_name_mapping: Dict[str, str] = {}  # Letta tool ID -> Letta name
 
     async def sync_agent_tools(self, agent_id: str, openai_tools: List[Dict[str, Any]]) -> None:
         """
@@ -58,11 +59,14 @@ class ProxyToolBridge:
             tool_id = self._find_tool_id_by_name(current_tools, tool_name)
             if tool_id:
                 await self.client.agents.tools.detach(agent_id, tool_id)
+                # Clean up mappings
+                self._remove_tool_from_mappings(tool_id)
                 logger.info(f"Removed tool {tool_name} from agent {agent_id}")
 
         # If no tools requested, we're done after cleanup
         if not openai_tools:
             self.tool_mapping.clear()
+            self.letta_name_mapping.clear()
             logger.info("No tools requested, cleaned up all proxy tools")
             return
 
@@ -73,21 +77,23 @@ class ProxyToolBridge:
                 proxy_tool = await self._create_proxy_tool(openai_tool)
                 await self.client.agents.tools.attach(agent_id, proxy_tool.id)
                 self.tool_mapping[openai_tool['function']['name']] = proxy_tool.id
-                logger.info(f"Added proxy tool {openai_tool['function']['name']} to agent {agent_id}")
+                self.letta_name_mapping[proxy_tool.id] = proxy_tool.name
+                logger.info(f"Added proxy tool {proxy_tool.name} to agent {agent_id}")
 
-        # Update mapping for existing tools
+        # Update mapping for existing tools (now with prefix)
         for openai_tool in openai_tools:
             if openai_tool['function']['name'] not in to_add:
                 # Tool already exists, update mapping
-                existing_tool_id = self._find_tool_id_by_name(current_tools, openai_tool['function']['name'])
+                existing_tool_id = self._find_tool_id_by_name(current_tools, f"proxy_{openai_tool['function']['name']}")
                 if existing_tool_id:
                     self.tool_mapping[openai_tool['function']['name']] = existing_tool_id
+                    self.letta_name_mapping[existing_tool_id] = f"proxy_{openai_tool['function']['name']}"
 
         logger.info(f"Tool sync complete. Current tools: {list(requested_tool_names)}")
 
     async def _create_proxy_tool(self, openai_tool: Dict[str, Any]) -> Any:
         """
-        Create a proxy tool that formats calls for downstream consumption.
+        Create a proxy tool with prefixed name to avoid conflicts with Letta built-in tools.
 
         Args:
             openai_tool: OpenAI tool definition
@@ -95,13 +101,15 @@ class ProxyToolBridge:
         Returns:
             Letta tool object
         """
-        function_name = openai_tool['function']['name']
+        openai_function_name = openai_tool['function']['name']
+        # Use prefixed name for Letta tool to avoid conflicts with built-in tools
+        letta_function_name = f"proxy_{openai_function_name}"
         function_args = self._generate_function_args(openai_tool)
 
         # Create source code for proxy tool
         required_params = self._get_required_params(openai_tool)
         source_code = f"""
-def {function_name}({function_args}):
+def {letta_function_name}({function_args}):
     # This is a proxy tool that formats calls for downstream execution
     # Return the tool call in a format that can be processed by the proxy
     import json
@@ -120,17 +128,18 @@ def {function_name}({function_args}):
         "type": "proxy_tool_call",
         "tool_call_id": "{self._generate_tool_call_id()}",
         "function": {{
-            "name": "{function_name}",
+            "name": "{openai_function_name}",  # Return original OpenAI name
             "arguments": json.dumps(actual_args)
         }}
     }}
 """
 
-        # Create the tool using Letta's upsert API
+        # Create the tool using Letta's upsert API with prefixed name
         proxy_tool = await self.client.tools.upsert(
             source_code=source_code,
-            description=f"Proxy tool for {function_name}",
-            json_schema=openai_tool['function']
+            description=f"Proxy tool for {openai_function_name}",
+            json_schema=openai_tool['function'],
+            name=letta_function_name  # Use prefixed name
         )
 
         return proxy_tool
@@ -171,6 +180,21 @@ def {function_name}({function_args}):
                 return tool.id
         return None
 
+    def _remove_tool_from_mappings(self, tool_id: str) -> None:
+        """Remove a tool from both mappings."""
+        # Remove from OpenAI name -> Letta ID mapping
+        openai_names_to_remove = [name for name, tid in self.tool_mapping.items() if tid == tool_id]
+        for name in openai_names_to_remove:
+            del self.tool_mapping[name]
+        
+        # Remove from Letta ID -> Letta name mapping
+        if tool_id in self.letta_name_mapping:
+            del self.letta_name_mapping[tool_id]
+
+    def get_letta_tool_name(self, tool_call_id: str) -> Optional[str]:
+        """Get the Letta tool name for a tool call ID."""
+        return self.letta_name_mapping.get(tool_call_id)
+
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:8]}"
@@ -190,6 +214,7 @@ def {function_name}({function_args}):
         """Clean up all proxy tools for an agent."""
         logger.info(f"Cleaning up proxy tools for agent {agent_id}")
         self.tool_mapping.clear()
+        self.letta_name_mapping.clear()
 
 
 # Global instance
