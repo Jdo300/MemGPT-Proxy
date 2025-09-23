@@ -1,3 +1,4 @@
+# FILE: proxy_tool_bridge.py
 """
 Letta Proxy Tool Bridge
 
@@ -50,18 +51,23 @@ class ProxyToolBridge:
         current_tools = await self.client.agents.tools.list(agent_id)
         current_tool_names = {tool.name for tool in current_tools}
 
-        # Calculate requested tools (handle None case)
-        requested_tool_names = {tool['function']['name'] for tool in openai_tools} if openai_tools else set()
+        # Requested Letta-side names (prefixed), handle None case
+        requested_letta_names: Set[str] = (
+            {f'proxy_{tool["function"]["name"]}' for tool in openai_tools}
+            if openai_tools else set()
+        )
 
-        # Remove tools not in request (or all tools if no tools requested)
-        to_remove = current_tool_names - requested_tool_names
+        # Remove only our proxy_ tools that are not requested; leave built-ins intact
+        to_remove = {
+            name for name in current_tool_names
+            if name.startswith("proxy_") and name not in requested_letta_names
+        }
         for tool_name in to_remove:
             tool_id = self._find_tool_id_by_name(current_tools, tool_name)
             if tool_id:
                 await self.client.agents.tools.detach(agent_id, tool_id)
-                # Clean up mappings
                 self._remove_tool_from_mappings(tool_id)
-                logger.info(f"Removed tool {tool_name} from agent {agent_id}")
+                logger.info(f"Removed proxy tool {tool_name} from agent {agent_id}")
 
         # If no tools requested, we're done after cleanup
         if not openai_tools:
@@ -70,26 +76,26 @@ class ProxyToolBridge:
             logger.info("No tools requested, cleaned up all proxy tools")
             return
 
-        # Add tools in request but not on agent
-        to_add = requested_tool_names - current_tool_names
+        # Add proxy_ tools that are requested but not present
+        to_add_names = requested_letta_names - current_tool_names
         for openai_tool in openai_tools:
-            if openai_tool['function']['name'] in to_add:
+            prefixed = f'proxy_{openai_tool["function"]["name"]}'
+            if prefixed in to_add_names:
                 proxy_tool = await self._create_proxy_tool(openai_tool)
                 await self.client.agents.tools.attach(agent_id, proxy_tool.id)
                 self.tool_mapping[openai_tool['function']['name']] = proxy_tool.id
                 self.letta_name_mapping[proxy_tool.id] = proxy_tool.name
                 logger.info(f"Added proxy tool {proxy_tool.name} to agent {agent_id}")
 
-        # Update mapping for existing tools (now with prefix)
+        # Map existing proxy_ tools
         for openai_tool in openai_tools:
-            if openai_tool['function']['name'] not in to_add:
-                # Tool already exists, update mapping
-                existing_tool_id = self._find_tool_id_by_name(current_tools, f"proxy_{openai_tool['function']['name']}")
-                if existing_tool_id:
-                    self.tool_mapping[openai_tool['function']['name']] = existing_tool_id
-                    self.letta_name_mapping[existing_tool_id] = f"proxy_{openai_tool['function']['name']}"
+            prefixed = f'proxy_{openai_tool["function"]["name"]}'
+            existing_tool_id = self._find_tool_id_by_name(current_tools, prefixed)
+            if existing_tool_id:
+                self.tool_mapping[openai_tool['function']['name']] = existing_tool_id
+                self.letta_name_mapping[existing_tool_id] = prefixed
 
-        logger.info(f"Tool sync complete. Current tools: {list(requested_tool_names)}")
+        logger.info(f"Tool sync complete. Current tools: {list(requested_letta_names)}")
 
     async def _create_proxy_tool(self, openai_tool: Dict[str, Any]) -> Any:
         """
@@ -154,8 +160,10 @@ def {letta_function_name}({function_args}):
             param_type = param_info.get('type', 'str')
             if param_type == 'string':
                 args.append(f"{param_name}: str = ''")
-            elif param_type == 'number' or param_type == 'integer':
+            elif param_type == 'number':
                 args.append(f"{param_name}: float = 0")
+            elif param_type == 'integer':
+                args.append(f"{param_name}: int = 0")
             elif param_type == 'boolean':
                 args.append(f"{param_name}: bool = False")
             elif param_type == 'array':
@@ -191,22 +199,22 @@ def {letta_function_name}({function_args}):
         if tool_id in self.letta_name_mapping:
             del self.letta_name_mapping[tool_id]
 
-    def get_letta_tool_name(self, tool_call_id: str) -> Optional[str]:
-        """Get the Letta tool name for a tool call ID."""
-        return self.letta_name_mapping.get(tool_call_id)
+    def get_letta_tool_name(self, tool_id: str) -> Optional[str]:
+        """Get the Letta tool *name* for a Letta tool ID."""
+        return self.letta_name_mapping.get(tool_id)
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:8]}"
 
-    def is_proxy_tool_call(self, tool_call_id: str) -> bool:
-        """Check if a tool call ID belongs to a proxy tool."""
-        return tool_call_id in self.tool_mapping.values()
+    def is_proxy_tool_call(self, tool_id: str) -> bool:
+        """Check if a Letta tool ID belongs to a proxy tool."""
+        return tool_id in self.tool_mapping.values()
 
-    def get_proxy_tool_name(self, tool_call_id: str) -> Optional[str]:
-        """Get the OpenAI tool name for a proxy tool call ID."""
-        for name, call_id in self.tool_mapping.items():
-            if call_id == tool_call_id:
+    def get_proxy_tool_name(self, tool_id: str) -> Optional[str]:
+        """Get the OpenAI tool name for a proxy tool Letta ID."""
+        for name, tid in self.tool_mapping.items():
+            if tid == tool_id:
                 return name
         return None
 
