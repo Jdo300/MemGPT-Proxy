@@ -1,0 +1,22 @@
+{
+  "model": "Milo",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are Roo Code, an AI programming assistant. You help users write, debug, and improve code."
+    },
+    {
+      "role": "user",
+      "content": "Hello, I need help with Python."
+    },
+    {
+      "role": "assistant", 
+      "content": "Hello! I'd be happy to help you with Python. What specific Python topic or problem would you like assistance with?"
+    },
+    {
+      "role": "user",
+      "content": "Can you help me write a function to calculate the fibonacci sequence?"
+    }
+  ],
+  "stream": false  
+}

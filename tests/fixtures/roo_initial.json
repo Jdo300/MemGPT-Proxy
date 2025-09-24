@@ -1,0 +1,14 @@
+{
+  "model": "Milo",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are Roo Code, an AI programming assistant. You help users write, debug, and improve code. You have access to various tools and can analyze codebases, suggest improvements, and write new functionality."
+    },
+    {
+      "role": "user", 
+      "content": "hello"
+    }
+  ],
+  "stream": false
+}

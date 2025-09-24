@@ -113,15 +113,58 @@ async def health_check() -> Dict[str, Any]:
     }
 
 
+async def _prepare_messages(messages: List[Dict[str, Any]]) -> List[MessageCreate]:
+    """
+    Prepare a list of messages for Letta, supporting multiple roles and message types.
+    This enables proper multi-turn conversations and system message handling.
+    """
+    prepared_messages = []
+    
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        
+        if role == "user":
+            # User messages pass through directly
+            prepared_messages.append(
+                MessageCreate(role="user", content=[TextContent(text=content)])
+            )
+        elif role == "system":
+            # System messages are converted to user messages with a prefix for Letta compatibility
+            system_content = f"[System]: {content}"
+            prepared_messages.append(
+                MessageCreate(role="user", content=[TextContent(text=system_content)])
+            )
+        elif role == "assistant":
+            # Assistant messages represent conversation history
+            # Convert to user messages with a prefix to maintain context
+            assistant_content = f"[Assistant Previous]: {content}"
+            prepared_messages.append(
+                MessageCreate(role="user", content=[TextContent(text=assistant_content)])
+            )
+        elif role == "tool":
+            # Tool messages - convert to user messages with tool context
+            tool_call_id = msg.get("tool_call_id", "unknown")
+            tool_content = f"[Tool Result {tool_call_id}]: {content}"
+            prepared_messages.append(
+                MessageCreate(role="user", content=[TextContent(text=tool_content)])
+            )
+        else:
+            # Unknown role - log warning and convert to user message to avoid breaking
+            logger.warning(f"Unknown message role '{role}' at index {i}, converting to user message")
+            fallback_content = f"[Unknown Role {role}]: {content}"
+            prepared_messages.append(
+                MessageCreate(role="user", content=[TextContent(text=fallback_content)])
+            )
+    
+    return prepared_messages
+
+
+# Backward compatibility function for single message processing
 async def _prepare_message(last: Dict[str, Any]) -> MessageCreate:
-    role = last.get("role")
-    if role == "user":
-        content = last.get("content", "")
-        return MessageCreate(role="user", content=[TextContent(text=content)])
-    else:
-        # For now, only handle user messages. Tool messages would require
-        # more complex handling with the Letta SDK
-        raise HTTPException(status_code=400, detail=f"Unsupported message role: {role}. Currently only 'user' role is supported.")
+    """Legacy function for single message processing - delegates to _prepare_messages"""
+    messages = await _prepare_messages([last])
+    return messages[0] if messages else MessageCreate(role="user", content=[TextContent(text="")])
 
 
 @app.post("/v1/chat/completions")
@@ -140,12 +183,18 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
     actual_agent_name = list(agent_map.keys())[list(agent_map.values()).index(agent_id)]
     logger.info(f"Using agent: {actual_agent_name} for model: {body.model}")
 
-    # Log tool information if provided
+    # Log request information
     if body.tools:
         logger.info(f"Request includes {len(body.tools)} tools: {[tool['function']['name'] for tool in body.tools]}")
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages required")
-    message = await _prepare_message(body.messages[-1])
+    
+    # Process all messages instead of just the last one
+    messages = await _prepare_messages(body.messages)
+    
+    # Log message processing info
+    logger.info(f"Processing {len(body.messages)} messages: roles={[msg.get('role', 'unknown') for msg in body.messages]}")
+    logger.info(f"Converted to {len(messages)} Letta messages")
 
     # Handle tool results if provided (non-streaming case)
     if body.tool_results and not body.stream:
@@ -194,7 +243,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                         )
                     streaming_messages.extend(tool_return_messages)
                 
-                streaming_messages.append(message)
+                streaming_messages.extend(messages)
 
                 # Optional: primer delta with assistant role (improves client compatibility)
                 primer = {
@@ -398,7 +447,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
         await proxy_bridge.sync_agent_tools(agent_id, body.tools)
         logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
 
-    resp = await client.agents.messages.create(agent_id=agent_id, messages=[message])
+    resp = await client.agents.messages.create(agent_id=agent_id, messages=messages)
     assistant_messages: List[AssistantMessage] = []
     tool_calls: List[ToolCallMessage] = []
     tool_returns: List[ToolReturnMessage] = []
