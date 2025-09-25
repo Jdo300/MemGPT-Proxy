@@ -71,20 +71,27 @@ async def startup_event() -> None:
             # For local servers, API key might be used differently
             client_kwargs["token"] = LETTA_API_KEY
 
+    # Debug: Check if the URL scheme is causing issues
+    print(f"Creating Letta client with base_url: {LETTA_BASE_URL}")
+    print(f"URL scheme: {LETTA_BASE_URL.split('://')[0] if '://' in LETTA_BASE_URL else 'No scheme'}")
+
+    
+
     client = AsyncLetta(**client_kwargs)
 
     try:
         agents = await client.agents.list()
         agent_map = {agent.name: agent.id for agent in agents}
         logger.info(f"Connected to Letta server. Found {len(agents)} agents.")
+    except Exception as e:
+        logger.warning(f"Could not connect to Letta server on startup: {e}")
+        logger.warning("Agent list will be populated on first request")
+        agent_map = {}
 
-        # Initialize proxy tool bridge
+    # Initialize proxy tool bridge (only if client is working)
+    if agent_map:
         initialize_proxy_bridge(client)
         logger.info("Proxy tool bridge initialized successfully.")
-
-    except Exception as e:
-        logger.error(f"Failed to connect to Letta server: {e}")
-        raise
 
 
 @app.get("/v1/models")
@@ -119,44 +126,59 @@ async def _prepare_messages(messages: List[Dict[str, Any]]) -> List[MessageCreat
     This enables proper multi-turn conversations and system message handling.
     """
     prepared_messages = []
-    
+
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
-        
+
+        # Handle content that might be a string or a list of content blocks
+        if isinstance(content, list):
+            # Content is a list of content blocks (OpenAI format)
+            # Extract text from all text blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            final_content = "".join(text_parts)
+        else:
+            # Content is a string
+            final_content = str(content)
+
         if role == "user":
             # User messages pass through directly
             prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=content)])
+                MessageCreate(role="user", content=[TextContent(text=final_content)])
             )
         elif role == "system":
             # System messages are converted to user messages with a prefix for Letta compatibility
-            system_content = f"[System]: {content}"
+            system_content = f"[System]: {final_content}"
             prepared_messages.append(
                 MessageCreate(role="user", content=[TextContent(text=system_content)])
             )
         elif role == "assistant":
             # Assistant messages represent conversation history
             # Convert to user messages with a prefix to maintain context
-            assistant_content = f"[Assistant Previous]: {content}"
+            assistant_content = f"[Assistant Previous]: {final_content}"
             prepared_messages.append(
                 MessageCreate(role="user", content=[TextContent(text=assistant_content)])
             )
         elif role == "tool":
             # Tool messages - convert to user messages with tool context
             tool_call_id = msg.get("tool_call_id", "unknown")
-            tool_content = f"[Tool Result {tool_call_id}]: {content}"
+            tool_content = f"[Tool Result {tool_call_id}]: {final_content}"
             prepared_messages.append(
                 MessageCreate(role="user", content=[TextContent(text=tool_content)])
             )
         else:
             # Unknown role - log warning and convert to user message to avoid breaking
             logger.warning(f"Unknown message role '{role}' at index {i}, converting to user message")
-            fallback_content = f"[Unknown Role {role}]: {content}"
+            fallback_content = f"[Unknown Role {role}]: {final_content}"
             prepared_messages.append(
                 MessageCreate(role="user", content=[TextContent(text=fallback_content)])
             )
-    
+
     return prepared_messages
 
 
@@ -275,7 +297,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "content": "",
+                                        "content": None,
                                         "reasoning": event.reasoning
                                     },
                                     "finish_reason": None,
@@ -293,7 +315,8 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "content": event.content
+                                        "content": event.content,
+                                        "reasoning": None
                                     },
                                     "finish_reason": None,
                                 }
@@ -380,7 +403,8 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "content": event.content
+                                        "content": event.content,
+                                        "reasoning": None
                                     },
                                     "finish_reason": None,
                                 }
