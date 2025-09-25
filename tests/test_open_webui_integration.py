@@ -8,8 +8,11 @@ import asyncio
 import json
 import os
 import time
+
+import pytest
 import requests
-from openai import OpenAI
+
+OpenAI = pytest.importorskip("openai").OpenAI
 
 # Configuration
 PROXY_BASE_URL = "http://localhost:8000/v1"

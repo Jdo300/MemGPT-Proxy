@@ -5,8 +5,8 @@ import uuid
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
 from letta_client import AsyncLetta, MessageCreate
@@ -18,6 +18,7 @@ from letta_client.types import (
 )
 
 from proxy_tool_bridge import ProxyToolBridge, initialize_proxy_bridge, get_proxy_bridge
+from proxy_overlay import ProxyOverlayManager
 
 # Configuration from environment variables
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
@@ -34,6 +35,7 @@ app = FastAPI()
 
 client: Optional[AsyncLetta] = None
 agent_map: Dict[str, str] = {}
+overlay_manager: Optional[ProxyOverlayManager] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -42,6 +44,57 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
+
+
+def _normalize_content(content: Any) -> str:
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and "text" in block:
+                    parts.append(str(block.get("text", "")))
+                elif "content" in block and isinstance(block["content"], str):
+                    parts.append(block["content"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _collect_system_content(messages: List[Dict[str, Any]]) -> Optional[str]:
+    system_chunks: List[str] = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_chunks.append(_normalize_content(msg.get("content")))
+    if not system_chunks:
+        return None
+    filtered = [chunk for chunk in system_chunks if chunk]
+    if not filtered:
+        return None
+    return "\n\n".join(filtered)
+
+
+def _extract_latest_user_message(messages: List[Dict[str, Any]]) -> Optional[str]:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            text = _normalize_content(msg.get("content"))
+            if text:
+                return text
+            return ""
+    return None
+
+
+def _extract_trailing_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not messages:
+        return []
+    last_assistant_idx = -1
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "assistant":
+            last_assistant_idx = idx
+    trailing = messages[last_assistant_idx + 1 :] if last_assistant_idx >= 0 else messages
+    return [msg for msg in trailing if msg.get("role") == "tool"]
 
 
 def validate_configuration() -> None:
@@ -53,7 +106,7 @@ def validate_configuration() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global client, agent_map
+    global client, agent_map, overlay_manager
 
     # Validate configuration
     validate_configuration()
@@ -88,6 +141,8 @@ async def startup_event() -> None:
         logger.warning("Agent list will be populated on first request")
         agent_map = {}
 
+    overlay_manager = ProxyOverlayManager(client)
+
     # Initialize proxy tool bridge (only if client is working)
     if agent_map:
         initialize_proxy_bridge(client)
@@ -120,77 +175,17 @@ async def health_check() -> Dict[str, Any]:
     }
 
 
-async def _prepare_messages(messages: List[Dict[str, Any]]) -> List[MessageCreate]:
-    """
-    Prepare a list of messages for Letta, supporting multiple roles and message types.
-    This enables proper multi-turn conversations and system message handling.
-    """
-    prepared_messages = []
+if os.getenv("PROXY_DEBUG_SESSIONS") == "1":
 
-    for i, msg in enumerate(messages):
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-
-        # Handle content that might be a string or a list of content blocks
-        if isinstance(content, list):
-            # Content is a list of content blocks (OpenAI format)
-            # Extract text from all text blocks
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            final_content = "".join(text_parts)
-        else:
-            # Content is a string
-            final_content = str(content)
-
-        if role == "user":
-            # User messages pass through directly
-            prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=final_content)])
-            )
-        elif role == "system":
-            # System messages are converted to user messages with a prefix for Letta compatibility
-            system_content = f"[System]: {final_content}"
-            prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=system_content)])
-            )
-        elif role == "assistant":
-            # Assistant messages represent conversation history
-            # Convert to user messages with a prefix to maintain context
-            assistant_content = f"[Assistant Previous]: {final_content}"
-            prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=assistant_content)])
-            )
-        elif role == "tool":
-            # Tool messages - convert to user messages with tool context
-            tool_call_id = msg.get("tool_call_id", "unknown")
-            tool_content = f"[Tool Result {tool_call_id}]: {final_content}"
-            prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=tool_content)])
-            )
-        else:
-            # Unknown role - log warning and convert to user message to avoid breaking
-            logger.warning(f"Unknown message role '{role}' at index {i}, converting to user message")
-            fallback_content = f"[Unknown Role {role}]: {final_content}"
-            prepared_messages.append(
-                MessageCreate(role="user", content=[TextContent(text=fallback_content)])
-            )
-
-    return prepared_messages
-
-
-# Backward compatibility function for single message processing
-async def _prepare_message(last: Dict[str, Any]) -> MessageCreate:
-    """Legacy function for single message processing - delegates to _prepare_messages"""
-    messages = await _prepare_messages([last])
-    return messages[0] if messages else MessageCreate(role="user", content=[TextContent(text="")])
+    @app.get("/debug/sessions")
+    async def debug_sessions() -> Dict[str, Any]:
+        if overlay_manager is None:
+            raise HTTPException(status_code=503, detail="Overlay manager unavailable")
+        return overlay_manager.debug_dump()
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest) -> Any:
+async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any:
     # Handle model mapping - require exact agent name match
     agent_id = None
     if body.model in agent_map:
@@ -211,32 +206,96 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages required")
     
-    # Process all messages instead of just the last one
-    messages = await _prepare_messages(body.messages)
-    
-    # Log message processing info
-    logger.info(f"Processing {len(body.messages)} messages: roles={[msg.get('role', 'unknown') for msg in body.messages]}")
-    logger.info(f"Converted to {len(messages)} Letta messages")
+    system_content = _collect_system_content(body.messages)
 
-    # Handle tool results if provided (non-streaming case)
-    if body.tool_results and not body.stream:
-        # Process tool results and send them to Letta
-        tool_return_messages = []
+    if overlay_manager is None:
+        raise HTTPException(status_code=500, detail="Overlay manager unavailable")
+
+    headers_map = {k.lower(): v for k, v in request.headers.items()}
+    session_id = overlay_manager.derive_session_id(agent_id, system_content, headers_map)
+    overlay_changed, fallback_messages = await overlay_manager.apply_overlay(
+        agent_id, session_id, system_content
+    )
+
+    # Prepare tool return messages from tool_results or trailing tool messages
+    tool_return_messages: List[MessageCreate] = []
+    seen_tool_call_ids = set()
+    if body.tool_results:
         for tool_result in body.tool_results:
+            tool_call_id = tool_result.get("tool_call_id")
+            seen_tool_call_ids.add(tool_call_id)
+            tool_payload = tool_result.get("result", "")
             tool_return_messages.append(
                 MessageCreate(
                     role="tool",
-                    content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
-                    tool_call_id=tool_result.get("tool_call_id")
+                    content=[TextContent(text=json.dumps(tool_payload))],
+                    tool_call_id=tool_call_id,
                 )
             )
-        
-        # Send tool results to Letta agent
-        if tool_return_messages:
-            await client.agents.messages.create(
-                agent_id=agent_id,
-                messages=tool_return_messages
+
+    for tool_msg in _extract_trailing_tool_messages(body.messages):
+        tool_call_id = tool_msg.get("tool_call_id")
+        if tool_call_id and tool_call_id in seen_tool_call_ids:
+            continue
+        tool_content = _normalize_content(tool_msg.get("content"))
+        tool_return_messages.append(
+            MessageCreate(
+                role="tool",
+                content=[TextContent(text=tool_content)],
+                tool_call_id=tool_call_id,
             )
+        )
+        if tool_call_id:
+            seen_tool_call_ids.add(tool_call_id)
+
+    latest_user_text = _extract_latest_user_message(body.messages)
+    user_messages_to_send: List[MessageCreate] = []
+    if latest_user_text is not None:
+        user_messages_to_send.append(
+            MessageCreate(role="user", content=[TextContent(text=latest_user_text)])
+        )
+
+    # Compose full message payload in the correct order
+    outbound_messages = [*fallback_messages, *tool_return_messages, *user_messages_to_send]
+
+    logger.info(
+        "Forwarding to Letta agent=%s session=%s overlay_changed=%s new_user_messages=%d stream=%s",
+        actual_agent_name,
+        session_id,
+        overlay_changed,
+        len(user_messages_to_send),
+        body.stream,
+    )
+
+    if body.tools:
+        proxy_bridge = get_proxy_bridge()
+        await proxy_bridge.sync_agent_tools(agent_id, body.tools)
+        logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
+
+    if body.stream and not outbound_messages:
+        async def empty_stream():
+            stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+            primer = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": body.model,
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(primer, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            empty_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     if body.stream:
         async def event_stream():
@@ -244,29 +303,6 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
             # Keep one id for the entire stream (OpenAI behavior)
             stream_id = f"chatcmpl-{uuid.uuid4().hex}"
             try:
-                # Sync tools with agent if provided
-                if body.tools:
-                    proxy_bridge = get_proxy_bridge()
-                    await proxy_bridge.sync_agent_tools(agent_id, body.tools)
-                    logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
-
-                # Prepare messages for streaming - include tool results if present
-                streaming_messages = []
-                if body.tool_results:
-                    # Add tool return messages first, then the user message
-                    tool_return_messages = []
-                    for tool_result in body.tool_results:
-                        tool_return_messages.append(
-                            MessageCreate(
-                                role="tool",
-                                content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
-                                tool_call_id=tool_result.get("tool_call_id")
-                            )
-                        )
-                    streaming_messages.extend(tool_return_messages)
-                
-                streaming_messages.extend(messages)
-
                 # Optional: primer delta with assistant role (improves client compatibility)
                 primer = {
                     "id": stream_id,
@@ -283,7 +319,7 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
                 
                 async for event in client.agents.messages.create_stream(
                     agent_id=agent_id,
-                    messages=streaming_messages,
+                    messages=outbound_messages,
                     stream_tokens=True
                 ):
                     # Build chunk from event
@@ -445,33 +481,26 @@ async def chat_completions(body: ChatCompletionRequest) -> Any:
 
     assert client is not None
     
-    # Handle tool results if provided (non-streaming case)
-    if body.tool_results:
-        # Process tool results and send them to Letta
-        tool_return_messages = []
-        for tool_result in body.tool_results:
-            tool_return_messages.append(
-                MessageCreate(
-                    role="tool",
-                    content=[TextContent(text=json.dumps(tool_result.get("result", "")))],
-                    tool_call_id=tool_result.get("tool_call_id")
-                )
-            )
-        
-        # Send tool results to Letta agent
-        if tool_return_messages:
-            await client.agents.messages.create(
-                agent_id=agent_id,
-                messages=tool_return_messages
-            )
-    
-    # Sync tools with agent if provided
-    if body.tools:
-        proxy_bridge = get_proxy_bridge()
-        await proxy_bridge.sync_agent_tools(agent_id, body.tools)
-        logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
+    assert client is not None
 
-    resp = await client.agents.messages.create(agent_id=agent_id, messages=messages)
+    if not outbound_messages:
+        openai_resp = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")
+
+    resp = await client.agents.messages.create(agent_id=agent_id, messages=outbound_messages)
     assistant_messages: List[AssistantMessage] = []
     tool_calls: List[ToolCallMessage] = []
     tool_returns: List[ToolReturnMessage] = []
