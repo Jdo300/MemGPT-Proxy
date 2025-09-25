@@ -1,3 +1,42 @@
+"""
+Proxy Overlay System for Letta Agents
+
+This module implements the Proxy System Overlay functionality that enables persistent
+system prompt management for Letta agents. Instead of injecting system prompts into
+chat messages, the system stores them as persistent memory blocks in Letta's backend.
+
+Key Features:
+- **Dynamic Block Sizing**: Supports unlimited system prompt lengths (50K+ characters)
+- **Read-Only Protection**: Prevents agents from modifying system prompts
+- **Smart Block Reuse**: Checks for existing blocks to avoid database constraint violations
+- **Session-Based Caching**: Efficient caching with TTL for session state management
+- **Graceful Fallback**: Falls back to message-based system prompts if block creation fails
+- **Content Hashing**: Uses SHA256 hashing to detect system prompt changes
+- **LRU/TTL Caching**: Efficient memory management for session state
+
+Architecture:
+    ProxyOverlayManager: Main coordinator for overlay lifecycle management
+    SessionOverlayStore: LRU/TTL cache for session state persistence
+    _TTLCache: Generic TTL cache implementation for derived session keys
+
+The system ensures that:
+1. System prompts are stored as persistent Letta memory blocks
+2. Changes to system prompts are detected via content hashing
+3. Existing blocks are reused when content hasn't changed
+4. New blocks are created with appropriate size limits for large prompts
+5. Blocks are marked as read-only to prevent agent modification
+6. Session state is cached efficiently with TTL expiration
+
+Usage:
+    overlay_manager = ProxyOverlayManager(letta_client)
+    overlay_changed, fallbacks = await overlay_manager.apply_overlay(
+        agent_id, session_id, system_content, project_id=project_id
+    )
+
+Author: Jason Owens
+Version: 1.0.0
+"""
+
 import hashlib
 import logging
 import time
@@ -13,7 +52,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SessionOverlayState:
-    """Runtime state tracked for a single session's proxy overlay."""
+    """Runtime state tracked for a single session's proxy overlay.
+
+    This dataclass maintains the current state of system prompt overlay management
+    for a specific session, including content hash, block ID, and fallback status.
+
+    Attributes:
+        overlay_hash: SHA256 hash of the current system content for change detection
+        block_id: ID of the persistent memory block in Letta backend
+        fallback_applied: Whether fallback message injection has been used for this session
+        last_updated: Timestamp of last state update (monotonic time)
+    """
 
     overlay_hash: Optional[str] = None
     block_id: Optional[str] = None
@@ -22,9 +71,30 @@ class SessionOverlayState:
 
 
 class _TTLCache:
-    """Simple TTL + capacity bound cache supporting touch semantics."""
+    """Simple TTL + capacity bound cache supporting touch semantics.
+
+    Generic cache implementation with time-to-live (TTL) expiration and maximum
+    capacity limits. Uses LRU eviction when capacity is exceeded and automatically
+    removes expired entries on access.
+
+    Attributes:
+        _store: OrderedDict storing (timestamp, value) pairs for LRU ordering
+        _max_entries: Maximum number of entries to store before eviction
+        _ttl_seconds: Time-to-live in seconds for cache entries
+
+    Methods:
+        get: Retrieve value if not expired, update access time
+        set: Store value with current timestamp, evict if needed
+        items: Return all valid (non-expired) key-value pairs
+    """
 
     def __init__(self, max_entries: int, ttl_seconds: int) -> None:
+        """Initialize TTL cache with capacity and expiration settings.
+
+        Args:
+            max_entries: Maximum number of entries before LRU eviction
+            ttl_seconds: TTL for entries in seconds
+        """
         self._store: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
         self._max_entries = max_entries
         self._ttl_seconds = ttl_seconds
@@ -104,7 +174,35 @@ class SessionOverlayStore:
 
 
 class ProxyOverlayManager:
-    """Manages the lifecycle of the "Proxy System Overlay" block for sessions."""
+    """Manages the lifecycle of the "Proxy System Overlay" block for sessions.
+
+    This is the main coordinator for system prompt overlay management in the Letta Proxy.
+    It handles the creation, updating, and management of persistent memory blocks that
+    store system prompts separately from chat messages.
+
+    Key Features:
+    - **Dynamic Block Management**: Creates and updates Letta memory blocks for system prompts
+    - **Change Detection**: Uses SHA256 hashing to detect system prompt changes
+    - **Smart Reuse**: Reuses existing blocks when content hasn't changed
+    - **Session Caching**: Efficient caching of session state with TTL
+    - **Fallback Support**: Graceful fallback to message-based system prompts if needed
+    - **Read-Only Blocks**: Ensures system prompts cannot be modified by agents
+
+    The manager maintains separate caches for:
+    - Session overlay state (SessionOverlayStore)
+    - Derived session keys (_TTLCache)
+
+    Attributes:
+        OVERLAY_LABEL: Standard label used for overlay blocks ("proxy_system_overlay")
+        _client: AsyncLetta client for backend communication
+        _session_store: Session state management with LRU/TTL
+        _derived_sessions: Cache for derived session keys
+
+    Args:
+        client: AsyncLetta client instance
+        max_sessions: Maximum sessions to cache (default: 100)
+        ttl_seconds: TTL for cached sessions in seconds (default: 3 hours)
+    """
 
     OVERLAY_LABEL = "proxy_system_overlay"
 
@@ -115,15 +213,48 @@ class ProxyOverlayManager:
         max_sessions: int = 100,
         ttl_seconds: int = 3 * 60 * 60,
     ) -> None:
+        """Initialize the proxy overlay manager.
+
+        Args:
+            client: AsyncLetta client for backend communication
+            max_sessions: Maximum number of sessions to cache
+            ttl_seconds: Time-to-live for cached sessions (3 hours default)
+        """
         self._client = client
         self._session_store = SessionOverlayStore(max_sessions=max_sessions, ttl_seconds=ttl_seconds)
         self._derived_sessions = _TTLCache(max_entries=max_sessions, ttl_seconds=ttl_seconds)
 
     @staticmethod
     def _hash_content(content: str) -> str:
+        """Generate SHA256 hash of content for change detection.
+
+        Args:
+            content: System content to hash
+
+        Returns:
+            SHA256 hex digest of the content
+        """
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def derive_session_id(self, agent_id: str, system_content: Optional[str], headers: Dict[str, str]) -> str:
+        """Derive a unique session identifier for overlay management.
+
+        Session IDs are derived from multiple sources in order of preference:
+        1. Explicit session ID from headers (x-session-id or X-Session-Id)
+        2. Content-based ID using system content hash (for content-specific sessions)
+        3. Default fallback ID for agent (when no content is provided)
+
+        This allows for flexible session management while ensuring consistent
+        overlay behavior for the same content.
+
+        Args:
+            agent_id: The Letta agent identifier
+            system_content: System prompt content for hash-based session IDs
+            headers: HTTP headers that may contain explicit session ID
+
+        Returns:
+            Unique session identifier string
+        """
         header_id = headers.get("x-session-id") or headers.get("X-Session-Id")
         if header_id:
             return header_id
@@ -261,6 +392,21 @@ class ProxyOverlayManager:
         return overlay_changed, fallback_messages
 
     def debug_dump(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Debug method to inspect internal state of overlay manager.
+
+        Provides comprehensive debugging information about active sessions,
+        including overlay state, block IDs, and cached derived session keys.
+        This is useful for troubleshooting overlay issues and understanding
+        system behavior.
+
+        Returns:
+            Dictionary containing:
+            - sessions: Mapping of session IDs to their current state
+            - derived_session_keys: Cached derived session key mappings
+
+        Note:
+            This method is only available when PROXY_DEBUG_SESSIONS=1
+        """
         sessions: Dict[str, Dict[str, Optional[str]]] = {}
         for session_id, state in self._session_store.items():
             sessions[session_id] = {

@@ -1,10 +1,34 @@
+"""
+Letta Proxy Server - OpenAI-Compatible API for Letta Agents
+
+This module provides an OpenAI-compatible API server that acts as a proxy to Letta agents,
+enabling seamless integration with existing OpenAI-based applications while leveraging
+Letta's advanced memory and tool capabilities.
+
+The proxy supports:
+- System prompt overlay management through Letta memory blocks
+- Tool synchronization and execution
+- Streaming responses compatible with OpenAI's API
+- Dynamic agent discovery and mapping
+- Comprehensive error handling and fallback mechanisms
+
+Environment Variables (set in .env file):
+    LETTA_BASE_URL: Base URL for the Letta server (default: http://localhost:8283)
+    LETTA_API_KEY: API key for Letta authentication (required for Letta Cloud)
+    LETTA_PROJECT: Project name for Letta Cloud (default: default-project)
+    PROXY_DEBUG_SESSIONS: Enable debug endpoint for session inspection (default: disabled)
+
+Author: Jason Owens
+Version: 1.0.0
+"""
+
 import json
 import os
 import time
 import uuid
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
@@ -32,15 +56,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(
+    title="Letta Proxy Server",
+    description="OpenAI-compatible API proxy for Letta agents with advanced memory management",
+    version="1.0.0"
+)
 
 client: Optional[AsyncLetta] = None
 
 
 @dataclass
 class AgentDescriptor:
+    """Descriptor for Letta agents with ID and project mapping."""
     agent_id: str
-    project_id: Optional[str]
+    project_id: Optional[str] = None
 
 
 agent_map: Dict[str, AgentDescriptor] = {}
@@ -48,6 +77,15 @@ overlay_manager: Optional[ProxyOverlayManager] = None
 
 
 class ChatCompletionRequest(BaseModel):
+    """Request model for OpenAI-compatible chat completions endpoint.
+
+    Attributes:
+        model: The model/agent name to use for the request
+        messages: List of messages in OpenAI chat format
+        stream: Whether to stream the response (default: False)
+        tools: Optional list of tools available to the agent
+        tool_results: Optional list of tool execution results
+    """
     model: str
     messages: List[Dict[str, Any]]
     stream: Optional[bool] = False
@@ -56,6 +94,17 @@ class ChatCompletionRequest(BaseModel):
 
 
 def _normalize_content(content: Any) -> str:
+    """Normalize message content to string format.
+
+    Handles various content formats including strings, lists of content blocks,
+    and nested content structures commonly used in OpenAI API requests.
+
+    Args:
+        content: The content to normalize (str, list, dict, or None)
+
+    Returns:
+        Normalized string content, empty string if content is None
+    """
     if isinstance(content, list):
         parts: List[str] = []
         for block in content:
@@ -73,6 +122,17 @@ def _normalize_content(content: Any) -> str:
 
 
 def _collect_system_content(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Extract and combine all system messages from the request.
+
+    Collects all system messages from the messages list and combines them
+    into a single system prompt string. Filters out empty messages.
+
+    Args:
+        messages: List of messages in OpenAI chat format
+
+    Returns:
+        Combined system content or None if no system messages found
+    """
     system_chunks: List[str] = []
     for msg in messages:
         if msg.get("role") == "system":
@@ -86,6 +146,18 @@ def _collect_system_content(messages: List[Dict[str, Any]]) -> Optional[str]:
 
 
 def _extract_latest_user_message(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Extract the most recent user message content.
+
+    Searches through messages in reverse order to find the latest user message.
+    This is used for non-streaming responses where only the final user message
+    needs to be sent to the agent.
+
+    Args:
+        messages: List of messages in OpenAI chat format
+
+    Returns:
+        Latest user message content or None if no user messages found
+    """
     for msg in reversed(messages):
         if msg.get("role") == "user":
             text = _normalize_content(msg.get("content"))
@@ -96,6 +168,17 @@ def _extract_latest_user_message(messages: List[Dict[str, Any]]) -> Optional[str
 
 
 def _extract_trailing_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract tool messages that appear after the last assistant message.
+
+    Tool messages that come after the assistant's response (e.g., tool calls)
+    need to be forwarded to the agent for proper context and execution.
+
+    Args:
+        messages: List of messages in OpenAI chat format
+
+    Returns:
+        List of trailing tool messages to forward to the agent
+    """
     if not messages:
         return []
     last_assistant_idx = -1
@@ -107,14 +190,34 @@ def _extract_trailing_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict
 
 
 def validate_configuration() -> None:
-    """Validate that required environment variables are set."""
+    """Validate that required environment variables are set.
+
+    Logs warnings for configuration issues that might affect functionality:
+    - Default LETTA_BASE_URL being used
+    - Missing LETTA_API_KEY which may cause authentication failures
+
+    This function helps users identify configuration issues early.
+    """
     if LETTA_BASE_URL == "http://localhost:8283":
         logger.warning("LETTA_BASE_URL is using default value. Please set LETTA_BASE_URL environment variable.")
     if not LETTA_API_KEY:
         logger.warning("LETTA_API_KEY not set. Authentication may fail for Letta Cloud.")
 
+
 @app.on_event("startup")
 async def startup_event() -> None:
+    """Initialize the proxy server on startup.
+
+    This function performs the following initialization steps:
+    1. Validates environment configuration
+    2. Creates and configures the Letta client
+    3. Discovers available agents and builds the agent mapping
+    4. Initializes the proxy overlay manager for system prompt management
+    5. Sets up the proxy tool bridge for tool synchronization
+
+    If agent discovery fails, the system will still start but agent
+    information will be populated on the first request.
+    """
     global client, agent_map, overlay_manager
 
     # Validate configuration
@@ -137,7 +240,6 @@ async def startup_event() -> None:
     print(f"Creating Letta client with base_url: {LETTA_BASE_URL}")
     print(f"URL scheme: {LETTA_BASE_URL.split('://')[0] if '://' in LETTA_BASE_URL else 'No scheme'}")
 
-    
 
     client = AsyncLetta(**client_kwargs)
 
@@ -163,6 +265,15 @@ async def startup_event() -> None:
 
 @app.get("/v1/models")
 async def list_models() -> Dict[str, Any]:
+    """List all available Letta agents as OpenAI-compatible models.
+
+    This endpoint provides a list of all available Letta agents in the format
+    expected by OpenAI-compatible clients. Each agent is presented as a model
+    that can be used in chat completion requests.
+
+    Returns:
+        OpenAI-compatible response with list of available models/agents
+    """
     agents = await client.agents.list()
     data = [
         {
@@ -178,7 +289,17 @@ async def list_models() -> Dict[str, Any]:
 
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
-    """Health check endpoint for monitoring."""
+    """Health check endpoint for monitoring and diagnostics.
+
+    Provides comprehensive health information including:
+    - Overall system status
+    - Letta server connection status
+    - Configuration details
+    - Number of loaded agents
+
+    Returns:
+        Health status information for monitoring systems
+    """
     return {
         "status": "healthy",
         "letta_base_url": LETTA_BASE_URL,
@@ -191,6 +312,18 @@ if os.getenv("PROXY_DEBUG_SESSIONS") == "1":
 
     @app.get("/debug/sessions")
     async def debug_sessions() -> Dict[str, Any]:
+        """Debug endpoint to inspect active proxy overlay sessions.
+
+        This endpoint is only available when PROXY_DEBUG_SESSIONS=1 is set.
+        It provides detailed information about active system prompt overlay
+        sessions, including block IDs, content hashes, and session states.
+
+        Returns:
+            Debug information about active overlay sessions
+
+        Raises:
+            HTTPException: If overlay manager is unavailable (503)
+        """
         if overlay_manager is None:
             raise HTTPException(status_code=503, detail="Overlay manager unavailable")
         return overlay_manager.debug_dump()
@@ -198,6 +331,37 @@ if os.getenv("PROXY_DEBUG_SESSIONS") == "1":
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any:
+    """Main chat completions endpoint - OpenAI-compatible API for Letta agents.
+
+    This is the core endpoint that handles all chat completion requests. It provides
+    an OpenAI-compatible interface while leveraging Letta's advanced memory and tool
+    capabilities through the proxy overlay system.
+
+    The function performs the following key operations:
+    1. **Agent Resolution**: Maps OpenAI model names to Letta agent IDs
+    2. **System Prompt Management**: Applies system prompts via proxy overlay system
+    3. **Tool Handling**: Processes tool definitions and tool call results
+    4. **Message Processing**: Converts OpenAI format to Letta format
+    5. **Response Generation**: Handles both streaming and non-streaming responses
+    6. **Error Handling**: Comprehensive error handling with graceful fallbacks
+
+    Args:
+        body: OpenAI-compatible chat completion request
+        request: FastAPI request object for header access
+
+    Returns:
+        OpenAI-compatible response (streaming or non-streaming)
+
+    Raises:
+        HTTPException: For various error conditions (agent not found, missing messages, etc.)
+
+    The proxy overlay system ensures:
+    - System prompts are stored in persistent Letta memory blocks
+    - Unlimited system prompt lengths (50K+ characters supported)
+    - Read-only protection to prevent agents from modifying system prompts
+    - Smart block reuse to prevent database constraint violations
+    - Efficient session-based caching and state management
+    """
     # Handle model mapping - require exact agent name match
     agent_id = None
     agent_info = agent_map.get(body.model)
@@ -490,7 +654,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         )
 
     assert client is not None
-    
     assert client is not None
 
     if not outbound_messages:
