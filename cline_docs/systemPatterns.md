@@ -165,3 +165,56 @@ Results Returned → Formatted for Letta → Registry State Maintained
 - **ID Management**: Unique tool call ID generation and mapping
 - **State Management**: Per-request tool registry synchronization
 - **Result Processing**: Bidirectional result formatting (client ↔ Letta)
+
+## Proxy Overlay Pattern (IMPLEMENTED) ⭐
+
+### **Critical Architecture Pattern: Proxy Overlay System**
+**Design Philosophy**: Store system prompts in persistent memory blocks instead of chat injection
+
+#### **Core Design Principles:**
+- **Persistent Storage**: System prompts stored in Letta memory blocks, not chat messages
+- **Read-Only Protection**: Blocks locked with `read_only=True` to prevent agent modification
+- **Dynamic Sizing**: `limit=content_length` allows any system prompt size (50K+ characters)
+- **Smart Reuse**: Existing blocks updated instead of creating duplicates
+- **Session Management**: Hash-based change detection for efficient updates
+
+#### **Core Components:**
+
+1. **System Content Hash Generator**
+   - Calculate SHA256 hash of system content for change detection
+   - Enable efficient comparison without content analysis
+   - Support for content-based session management
+
+2. **Block Existence Checker**
+   - Query existing blocks for specific agent and label combination
+   - Prevent duplicate block creation and constraint violations
+   - Smart block reuse for identical content
+
+3. **Dynamic Block Manager**
+   - Create blocks with `limit=content_size` for any content length
+   - Set `read_only=True` to prevent agent modifications
+   - Proper metadata tagging for session tracking
+
+4. **Smart Update Logic**
+   - Update existing blocks when content changes
+   - Create new blocks only when none exist
+   - Avoid database constraint violations
+
+5. **Session State Manager**
+   - Track block IDs and content hashes per session
+   - Enable early returns for unchanged content
+   - TTL-based cleanup for old sessions
+
+#### **Complete Process Flow:**
+```
+System Content → Hash Calculation → Block Check → Update/Modify/Create →
+Block Attachment → Read-Only Protection → Session State Update
+```
+
+#### **Key Technical Implementation Details:**
+- **Dynamic Limits**: `limit=len(clean_content)` allows unlimited system prompt sizes
+- **Read-Only Enforcement**: `read_only=True` prevents agent modification of system prompts
+- **Constraint Avoidance**: Check existing blocks before attachment to prevent 409 conflicts
+- **Content Cleaning**: Remove problematic characters (null bytes, inconsistent line endings)
+- **Hash-Based Updates**: Efficient change detection without content comparison
+- **Session Continuity**: Reuse blocks across requests with same content hash

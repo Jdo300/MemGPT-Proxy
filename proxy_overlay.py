@@ -106,7 +106,7 @@ class SessionOverlayStore:
 class ProxyOverlayManager:
     """Manages the lifecycle of the "Proxy System Overlay" block for sessions."""
 
-    OVERLAY_LABEL = "Proxy System Overlay"
+    OVERLAY_LABEL = "proxy_system_overlay"
 
     def __init__(
         self,
@@ -171,32 +171,82 @@ class ProxyOverlayManager:
 
         try:
             if state.block_id:
+                logger.info(f"Updating existing block {state.block_id} for agent {agent_id}")
                 await self._client.blocks.modify(
                     state.block_id,
                     value=system_content,
                     label=self.OVERLAY_LABEL,
                     project_id=project_id,
                 )
+                logger.info(f"Successfully updated block {state.block_id}")
             else:
-                block = await self._client.blocks.create(
-                    value=system_content,
-                    label=self.OVERLAY_LABEL,
-                    metadata={"proxy_overlay_session": session_id},
-                    project_id=project_id,
-                )
-                if not getattr(block, "id", None):
-                    raise RuntimeError("Created overlay block missing id")
-                await self._client.agents.blocks.attach(agent_id, block.id)
-                state.block_id = block.id
+                # Check if a block with this label already exists for this agent
+                existing_blocks = await self._client.agents.blocks.list(agent_id)
+                overlay_block = None
+
+                # Look for existing block with our overlay label
+                for block in existing_blocks:
+                    if hasattr(block, 'label') and block.label == self.OVERLAY_LABEL:
+                        overlay_block = block
+                        break
+
+                if overlay_block:
+                    # Update the existing block instead of creating a new one
+                    logger.info(f"Updating existing overlay block {overlay_block.id} for agent {agent_id}")
+                    await self._client.blocks.modify(
+                        overlay_block.id,
+                        value=system_content,
+                        label=self.OVERLAY_LABEL,
+                        project_id=project_id,
+                    )
+                    state.block_id = overlay_block.id
+                    logger.info(f"Successfully updated existing overlay block {overlay_block.id}")
+                else:
+                    logger.info(f"Creating new block for agent {agent_id} (session {session_id})")
+                    logger.info(f"System content length: {len(system_content)} characters")
+                    logger.info(f"System content preview: {system_content[:200]}...")
+
+                    # Remove any problematic characters that might cause API issues
+                    clean_content = system_content.replace('\x00', '').replace('\r\n', '\n').replace('\r', '\n')
+
+                    # Use the limit parameter to allow blocks up to the actual content size
+                    # This should override the default 20K limit
+                    content_limit = len(clean_content)
+
+                    logger.info(f"Creating block with limit={content_limit} for {len(clean_content)} character content")
+
+                    # Create the block with the dynamic limit and read-only flag
+                    block = await self._client.blocks.create(
+                        value=clean_content,
+                        label=self.OVERLAY_LABEL,
+                        metadata={"proxy_overlay_session": session_id},
+                        project_id=project_id,
+                        limit=content_limit,  # Set limit to match actual content size
+                        read_only=True,  # Lock the block so agents can't modify it
+                    )
+
+                    # Extract block ID (SDK returns letta_client.types.block.Block object)
+                    block_id = block.id
+                    if not block_id:
+                        raise RuntimeError("Created overlay block missing id")
+
+                    # Attach block to agent
+                    await self._client.agents.blocks.attach(agent_id, block_id)
+
+                    state.block_id = block_id
 
             state.overlay_hash = overlay_hash
             state.fallback_applied = False
             overlay_changed = True
+            logger.info(f"Overlay successfully applied for agent {agent_id} (session {session_id})")
         except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "Proxy overlay update failed for agent %s (session %s): %s", agent_id, session_id, exc
+            logger.error(
+                f"Proxy overlay update failed for agent {agent_id} (session {session_id}): {exc}",
+                exc_info=True  # Include full traceback
             )
+            logger.error(f"Exception type: {type(exc)}")
             if not state.fallback_applied:
+                logger.warning(f"Applying fallback message for agent {agent_id}")
                 fallback_messages.append(
                     MessageCreate(
                         role="user",

@@ -12,6 +12,7 @@
 - ✅ **Health Monitoring**: `/health` endpoint for system monitoring
 - ✅ **Tool Calling Bridge**: **SOLVED** - Proxy tool bridge enables dynamic tool calling
 - ✅ **Agent Selection**: Strict validation requiring exact agent name match (no fallbacks)
+- ✅ **Proxy Overlay System**: **SOLVED** - Dynamic system prompt management with memory blocks
 
 ## What's been investigated and understood
 - ✅ **Architecture Analysis**: Identified core difference between OpenAI and Letta tool systems

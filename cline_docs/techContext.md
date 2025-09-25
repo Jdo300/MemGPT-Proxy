@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ### Running the application
 ```bash
-uvicorn main:app --reload
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### Testing
