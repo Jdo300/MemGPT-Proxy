@@ -162,7 +162,10 @@ class ProxyOverlayManager:
             return overlay_changed, fallback_messages
 
         overlay_hash = self._hash_content(system_content)
-        if state.overlay_hash == overlay_hash and state.block_id:
+
+        # Only return early if we have both the right hash AND a valid block
+        # This prevents the bug where hash matches but block creation failed
+        if state.overlay_hash == overlay_hash and state.block_id and state.block_id != "":
             self._session_store.set(session_id, state)
             return overlay_changed, fallback_messages
 
