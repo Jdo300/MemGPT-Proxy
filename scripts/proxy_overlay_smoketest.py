@@ -38,13 +38,24 @@ def _print(title: str, detail: str) -> None:
 def main() -> int:
     system_message = {
         "role": "system",
-        "content": "You are Milo, a concise assistant for overlay validation.",
+        "content": (
+            "You are Milo, a concise assistant helping validate the proxy overlay. "
+            "We're currently verifying a fix on the proxy server."
+        ),
     }
-    first_user = {"role": "user", "content": "Hello overlay!"}
-    follow_up_user = {"role": "user", "content": "Second turn, no system."}
+    first_user = {
+        "role": "user",
+        "content": "Hi Milo! This is a proxy server fix validation run—thanks for assisting.",
+    }
+    follow_up_user = {
+        "role": "user",
+        "content": "Second turn, confirming the overlay persisted during the proxy fix test.",
+    }
     changed_system = {
         "role": "system",
-        "content": "You are Milo, now respond enthusiastically!",
+        "content": (
+            "You are Milo, now respond enthusiastically while we finish proxy fix QA!"
+        ),
     }
     final_user = {"role": "user", "content": "Give me a pep talk."}
 
