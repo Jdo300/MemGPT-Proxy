@@ -292,7 +292,11 @@ class ProxyOverlayManager:
             self._session_store.set(session_id, state)
             return overlay_changed, fallback_messages
 
-        overlay_hash = self._hash_content(system_content)
+        clean_content = (
+            system_content.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+        )
+
+        overlay_hash = self._hash_content(clean_content)
 
         # Only return early if we have both the right hash AND a valid block
         # This prevents the bug where hash matches but block creation failed
@@ -305,14 +309,17 @@ class ProxyOverlayManager:
                 logger.info(f"Updating existing block {state.block_id} for agent {agent_id}")
                 await self._client.blocks.modify(
                     state.block_id,
-                    value=system_content,
+                    value=clean_content,
                     label=self.OVERLAY_LABEL,
                     project_id=project_id,
                 )
                 logger.info(f"Successfully updated block {state.block_id}")
             else:
                 # Check if a block with this label already exists for this agent
-                existing_blocks = await self._client.agents.blocks.list(agent_id)
+                existing_blocks: List = []
+                list_method = getattr(self._client.agents.blocks, "list", None)
+                if callable(list_method):
+                    existing_blocks = await list_method(agent_id)
                 overlay_block = None
 
                 # Look for existing block with our overlay label
@@ -326,7 +333,7 @@ class ProxyOverlayManager:
                     logger.info(f"Updating existing overlay block {overlay_block.id} for agent {agent_id}")
                     await self._client.blocks.modify(
                         overlay_block.id,
-                        value=system_content,
+                        value=clean_content,
                         label=self.OVERLAY_LABEL,
                         project_id=project_id,
                     )
@@ -334,27 +341,34 @@ class ProxyOverlayManager:
                     logger.info(f"Successfully updated existing overlay block {overlay_block.id}")
                 else:
                     logger.info(f"Creating new block for agent {agent_id} (session {session_id})")
-                    logger.info(f"System content length: {len(system_content)} characters")
-                    logger.info(f"System content preview: {system_content[:200]}...")
-
-                    # Remove any problematic characters that might cause API issues
-                    clean_content = system_content.replace('\x00', '').replace('\r\n', '\n').replace('\r', '\n')
-
+                    logger.info(f"System content length: {len(clean_content)} characters")
+                    logger.info(f"System content preview: {clean_content[:200]}...")
                     # Use the limit parameter to allow blocks up to the actual content size
                     # This should override the default 20K limit
                     content_limit = len(clean_content)
 
                     logger.info(f"Creating block with limit={content_limit} for {len(clean_content)} character content")
 
-                    # Create the block with the dynamic limit and read-only flag
-                    block = await self._client.blocks.create(
-                        value=clean_content,
-                        label=self.OVERLAY_LABEL,
-                        metadata={"proxy_overlay_session": session_id},
-                        project_id=project_id,
-                        limit=content_limit,  # Set limit to match actual content size
-                        read_only=True,  # Lock the block so agents can't modify it
-                    )
+                    base_kwargs = {
+                        "value": clean_content,
+                        "label": self.OVERLAY_LABEL,
+                        "metadata": {"proxy_overlay_session": session_id},
+                        "project_id": project_id,
+                    }
+
+                    try:
+                        # Create the block with the dynamic limit and read-only flag
+                        block = await self._client.blocks.create(
+                            **base_kwargs,
+                            limit=content_limit,  # Set limit to match actual content size
+                            read_only=True,  # Lock the block so agents can't modify it
+                        )
+                    except TypeError as type_error:
+                        error_message = str(type_error)
+                        if "unexpected keyword argument" in error_message:
+                            block = await self._client.blocks.create(**base_kwargs)
+                        else:
+                            raise
 
                     # Extract block ID (SDK returns letta_client.types.block.Block object)
                     block_id = block.id
@@ -381,7 +395,7 @@ class ProxyOverlayManager:
                 fallback_messages.append(
                     MessageCreate(
                         role="user",
-                        content=[TextContent(text=f"[Proxy System Overlay]: {system_content}")],
+                        content=[TextContent(text=f"[Proxy System Overlay]: {clean_content}")],
                     )
                 )
                 state.fallback_applied = True

@@ -2,27 +2,39 @@
 Real integration tests with actual Letta server and Milo agent.
 These tests exercise the real functionality to ensure it works in production.
 """
-import requests
+import os
 import json
 import time
-import os
 from typing import Dict, Any
 
+import requests
+
 # Configuration constants
-AGENT_NAME = "companion-agent-1758429513525"
+DEFAULT_BASE_URL = os.getenv("PROXY_BASE_URL", "http://localhost:8000")
+AGENT_NAME = os.getenv("PROXY_MODEL", "Milo")
+API_KEY = os.getenv("PROXY_API_KEY") or os.getenv("LETTTA_API_KEY") or os.getenv("LETTA_API_KEY")
 
 
 class LettaProxyTester:
     """Test the Letta Proxy with real Letta server."""
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(self, base_url: str = DEFAULT_BASE_URL):
         self.base_url = base_url
         self.session = requests.Session()
+        self.default_headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            self.default_headers["Authorization"] = f"Bearer {API_KEY}"
+
+    def _headers(self) -> Dict[str, str]:
+        """Return default headers for requests."""
+        return dict(self.default_headers)
 
     def test_health_endpoint(self) -> Dict[str, Any]:
         """Test the health check endpoint."""
         print("🩺 Testing health endpoint...")
-        response = self.session.get(f"{self.base_url}/health")
+        response = self.session.get(
+            f"{self.base_url}/health", headers=self._headers()
+        )
         response.raise_for_status()
 
         data = response.json()
@@ -34,7 +46,9 @@ class LettaProxyTester:
     def test_models_endpoint(self) -> Dict[str, Any]:
         """Test the models endpoint (should show Milo agent)."""
         print("📋 Testing models endpoint...")
-        response = self.session.get(f"{self.base_url}/v1/models")
+        response = self.session.get(
+            f"{self.base_url}/v1/models", headers=self._headers()
+        )
         response.raise_for_status()
 
         data = response.json()
@@ -56,7 +70,13 @@ class LettaProxyTester:
 
         return data
 
-    def test_chat_completion(self, message: str = "Hello! What's 2+2?") -> Dict[str, Any]:
+    def test_chat_completion(
+        self,
+        message: str = (
+            "Hi Milo! I'm running proxy server diagnostics to verify our latest fix. "
+            "Could you confirm you received this test and remind me what 2+2 equals?"
+        ),
+    ) -> Dict[str, Any]:
         """Test chat completion with Milo agent."""
         print(f"💬 Testing chat completion with message: '{message}'")
 
@@ -68,7 +88,7 @@ class LettaProxyTester:
         response = self.session.post(
             f"{self.base_url}/v1/chat/completions",
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers=self._headers(),
         )
         response.raise_for_status()
 
@@ -83,7 +103,15 @@ class LettaProxyTester:
 
         payload = {
             "model": AGENT_NAME,
-            "messages": [{"role": "user", "content": "What's the current date and time?"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Milo, this is a proxy server fix verification run. "
+                        "Could you fetch the current date and time via your tooling?"
+                    ),
+                }
+            ],
             "tools": [
                 {
                     "type": "function",
@@ -103,7 +131,7 @@ class LettaProxyTester:
         response = self.session.post(
             f"{self.base_url}/v1/chat/completions",
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers=self._headers(),
         )
         response.raise_for_status()
 
@@ -127,15 +155,23 @@ class LettaProxyTester:
 
         payload = {
             "model": AGENT_NAME,
-            "messages": [{"role": "user", "content": "Count to 5 slowly"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "For our proxy server fix QA, please count to 5 slowly so we can "
+                        "observe the streaming response."
+                    ),
+                }
+            ],
             "stream": True
         }
 
         response = self.session.post(
             f"{self.base_url}/v1/chat/completions",
             json=payload,
-            headers={"Content-Type": "application/json"},
-            stream=True
+            headers=self._headers(),
+            stream=True,
         )
         response.raise_for_status()
 
